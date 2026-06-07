@@ -1,0 +1,34 @@
+{
+	"name": "pi-mixlayer",
+	"version": "0.1.0",
+	"description": "Mixlayer provider extension for pi.",
+	"type": "module",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"pi-provider",
+		"mixlayer"
+	],
+	"files": [
+		"index.ts",
+		"README.md",
+		"package.json"
+	],
+	"scripts": {
+		"clean": "echo 'nothing to clean'",
+		"build": "echo 'nothing to build'",
+		"check": "tsc --noEmit"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "0.78.1",
+		"typescript": "5.9.3"
+	}
+}

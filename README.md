@@ -12,10 +12,10 @@ pi
 Inside pi, run:
 
 ```text
-/login mixlayer
+/login
 ```
 
-Enter your Mixlayer API key when prompted. Pi stores the credential in `~/.pi/agent/auth.json`.
+Select **Use an API key**, then choose **Mixlayer** from the provider list. Enter your Mixlayer API key when prompted. Pi stores the credential in `~/.pi/agent/auth.json`.
 
 The extension fetches the current model list from:
 

@@ -1,4 +1,7 @@
 import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 const MIXLAYER_PROVIDER_ID = "mixlayer";
 const MIXLAYER_PROVIDER_NAME = "Mixlayer";
@@ -7,6 +10,12 @@ const MIXLAYER_MODELS_URL = "https://models.mixlayer.ai/_openrouter/models";
 const MIXLAYER_DEFAULT_MODEL_IDS = ["qwen/qwen3.5-397b-a17b", "qwen/qwen3.6-35b-a3b"];
 const DEFAULT_CONTEXT_WINDOW = 128000;
 const DEFAULT_MAX_TOKENS = 4096;
+const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+interface CachedModels {
+	fetchedAt: string;
+	models: MixlayerModel[];
+}
 
 interface MixlayerModelsResponse {
 	data: MixlayerModel[];
@@ -90,6 +99,69 @@ function parseModelsResponse(payload: unknown): MixlayerModelsResponse {
 	return { data: models };
 }
 
+function getCachePath(): string {
+	return join(homedir(), ".pi", "agent", "mixlayer-models-cache.json");
+}
+
+async function readCache(skipTTL = false): Promise<MixlayerModel[] | undefined> {
+	try {
+		const raw = await readFile(getCachePath(), "utf8");
+		const parsed: unknown = JSON.parse(raw);
+		if (!isRecord(parsed) || typeof parsed.fetchedAt !== "string" || !Array.isArray(parsed.models)) {
+			return undefined;
+		}
+
+		const fetchedAt = new Date(parsed.fetchedAt).getTime();
+		if (!skipTTL && (Number.isNaN(fetchedAt) || Date.now() - fetchedAt > CACHE_TTL_MS)) {
+			return undefined;
+		}
+
+		return parsed.models.map(parseModel).filter((model): model is MixlayerModel => model !== undefined);
+	} catch {
+		return undefined;
+	}
+}
+
+async function writeCache(models: MixlayerModel[]): Promise<void> {
+	try {
+		const cachePath = getCachePath();
+		await mkdir(join(cachePath, ".."), { recursive: true });
+		const cache: CachedModels = { fetchedAt: new Date().toISOString(), models };
+		await writeFile(cachePath, JSON.stringify(cache), "utf8");
+	} catch {
+		// Cache write failures are non-fatal.
+	}
+}
+
+async function fetchModels(): Promise<MixlayerModel[]> {
+	const response = await fetch(MIXLAYER_MODELS_URL);
+	if (!response.ok) {
+		throw new Error(`Failed to fetch Mixlayer models: ${response.status} ${response.statusText}`);
+	}
+
+	const payload = parseModelsResponse(await response.json());
+	return payload.data;
+}
+
+async function fetchModelsWithCache(): Promise<MixlayerModel[]> {
+	const cached = await readCache();
+	if (cached && cached.length > 0) {
+		return cached;
+	}
+
+	try {
+		const models = await fetchModels();
+		await writeCache(models);
+		return models;
+	} catch (error) {
+		const stale = await readCache(true);
+		if (stale && stale.length > 0) {
+			return stale;
+		}
+		throw error;
+	}
+}
+
 function pricePerMillion(value: string | undefined): number {
 	const parsed = parseNumber(value);
 	return parsed === undefined ? 0 : parsed * 1_000_000;
@@ -141,13 +213,8 @@ function selectDefaultModel(models: ProviderModelConfig[]): ProviderModelConfig 
 }
 
 export default async function mixlayerExtension(pi: ExtensionAPI): Promise<void> {
-	const response = await fetch(MIXLAYER_MODELS_URL);
-	if (!response.ok) {
-		throw new Error(`Failed to fetch Mixlayer models: ${response.status} ${response.statusText}`);
-	}
-
-	const payload = parseModelsResponse(await response.json());
-	const models = payload.data.map(toProviderModel);
+	const mixlayerModels = await fetchModelsWithCache();
+	const models = mixlayerModels.map(toProviderModel);
 	const defaultModel = selectDefaultModel(models);
 
 	pi.registerProvider(MIXLAYER_PROVIDER_ID, {

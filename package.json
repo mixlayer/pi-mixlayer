@@ -10,18 +10,19 @@
 		"mixlayer"
 	],
 	"files": [
-		"index.ts",
+		"dist",
 		"README.md",
 		"package.json"
 	],
 	"scripts": {
-		"clean": "echo 'nothing to clean'",
-		"build": "echo 'nothing to build'",
-		"check": "tsc --noEmit"
+		"clean": "rm -rf dist",
+		"build": "tsc",
+		"check": "tsc --noEmit",
+		"prepublishOnly": "npm run clean && npm run build"
 	},
 	"pi": {
 		"extensions": [
-			"./index.ts"
+			"./dist/index.js"
 		]
 	},
 	"peerDependencies": {

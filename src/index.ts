@@ -12,6 +12,15 @@ const DEFAULT_CONTEXT_WINDOW = 128000;
 const DEFAULT_MAX_TOKENS = 4096;
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 
+const MIXLAYER_TRANSPORTS = [
+	"chat-completions",
+	"responses-sse",
+	"responses-websocket",
+	"responses-websocket-delta",
+] as const;
+
+type MixlayerTransport = (typeof MIXLAYER_TRANSPORTS)[number];
+
 interface CachedModels {
 	fetchedAt: string;
 	models: MixlayerModel[];
@@ -34,6 +43,12 @@ interface MixlayerModel {
 		input_cache_write?: string;
 	};
 	supported_features?: string[];
+}
+
+interface PiSettings {
+	mixlayer?: {
+		transport?: MixlayerTransport;
+	};
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -99,8 +114,16 @@ function parseModelsResponse(payload: unknown): MixlayerModelsResponse {
 	return { data: models };
 }
 
+function getAgentDir(): string {
+	return join(homedir(), ".pi", "agent");
+}
+
 function getCachePath(): string {
-	return join(homedir(), ".pi", "agent", "mixlayer-models-cache.json");
+	return join(getAgentDir(), "mixlayer-models-cache.json");
+}
+
+function getSettingsPath(): string {
+	return join(getAgentDir(), "mixlayer-settings.json");
 }
 
 async function readCache(skipTTL = false): Promise<MixlayerModel[] | undefined> {
@@ -162,6 +185,66 @@ async function fetchModelsWithCache(): Promise<MixlayerModel[]> {
 	}
 }
 
+async function readSettings(): Promise<PiSettings> {
+	try {
+		const raw = await readFile(getSettingsPath(), "utf8");
+		const parsed: unknown = JSON.parse(raw);
+		if (!isRecord(parsed)) {
+			return {};
+		}
+
+		const mixlayer = isRecord(parsed.mixlayer) ? parsed.mixlayer : {};
+		const transport = parseTransport(mixlayer.transport);
+		return { mixlayer: { transport } };
+	} catch {
+		return {};
+	}
+}
+
+async function writeSettings(settings: PiSettings): Promise<void> {
+	const settingsPath = getSettingsPath();
+	let parsed: Record<string, unknown> = {};
+	try {
+		const raw = await readFile(settingsPath, "utf8");
+		const existing: unknown = JSON.parse(raw);
+		if (isRecord(existing)) {
+			parsed = existing;
+		}
+	} catch {
+		// If the file doesn't exist or is invalid, start fresh.
+	}
+
+	if (settings.mixlayer?.transport) {
+		parsed.mixlayer = { ...(isRecord(parsed.mixlayer) ? parsed.mixlayer : {}), transport: settings.mixlayer.transport };
+	} else if (settings.mixlayer) {
+		parsed.mixlayer = { ...(isRecord(parsed.mixlayer) ? parsed.mixlayer : {}) };
+		delete (parsed.mixlayer as Record<string, unknown>).transport;
+	}
+
+	await mkdir(join(settingsPath, ".."), { recursive: true });
+	await writeFile(settingsPath, `${JSON.stringify(parsed, null, 2)}\n`, "utf8");
+}
+
+function parseTransport(value: unknown): MixlayerTransport | undefined {
+	if (typeof value !== "string") {
+		return undefined;
+	}
+	return MIXLAYER_TRANSPORTS.includes(value as MixlayerTransport) ? (value as MixlayerTransport) : undefined;
+}
+
+function resolveTransport(settings: PiSettings): MixlayerTransport {
+	const envTransport = parseTransport(process.env.MIXLAYER_TRANSPORT);
+	if (envTransport) {
+		return envTransport;
+	}
+
+	if (settings.mixlayer?.transport) {
+		return settings.mixlayer.transport;
+	}
+
+	return "chat-completions";
+}
+
 function pricePerMillion(value: string | undefined): number {
 	const parsed = parseNumber(value);
 	return parsed === undefined ? 0 : parsed * 1_000_000;
@@ -217,12 +300,39 @@ export default async function mixlayerExtension(pi: ExtensionAPI): Promise<void>
 	const models = mixlayerModels.map(toProviderModel);
 	const defaultModel = selectDefaultModel(models);
 
+	const settings = await readSettings();
+	const transport = resolveTransport(settings);
+
 	pi.registerProvider(MIXLAYER_PROVIDER_ID, {
 		name: MIXLAYER_PROVIDER_NAME,
 		baseUrl: MIXLAYER_BASE_URL,
 		apiKey: "$MIXLAYER_API_KEY",
 		api: "openai-completions",
 		models,
+	});
+
+	pi.registerCommand("mixlayer-transport", {
+		description: "Set the Mixlayer transport (chat-completions, responses-sse, responses-websocket, responses-websocket-delta).",
+		getArgumentCompletions(prefix) {
+			return MIXLAYER_TRANSPORTS.filter((t) => t.startsWith(prefix)).map((value) => ({ value, label: value, description: value }));
+		},
+		async handler(args, ctx) {
+			const trimmed = args.trim();
+			if (!trimmed) {
+				const current = resolveTransport(await readSettings());
+				ctx.ui.notify(`Current Mixlayer transport: ${current}`, "info");
+				return;
+			}
+
+			const transport = parseTransport(trimmed);
+			if (!transport) {
+				ctx.ui.notify(`Invalid Mixlayer transport: ${trimmed}. Valid options: ${MIXLAYER_TRANSPORTS.join(", ")}`, "error");
+				return;
+			}
+
+			await writeSettings({ mixlayer: { transport } });
+			ctx.ui.notify(`Mixlayer transport set to ${transport}. Reload extensions to apply.`, "info");
+		},
 	});
 
 	pi.on("session_start", async (_event, ctx) => {

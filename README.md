@@ -39,7 +39,7 @@ The extension supports configurable transport selection for the `mixlayer` provi
 | --- | --- | --- |
 | `chat-completions` | Default | Uses Pi's `openai-completions` transport. |
 | `responses-sse` | Supported | Uses Mixlayer's Responses API over HTTP/SSE through a Mixlayer-specific wrapper around Pi's Responses transport. |
-| `responses-websocket` | Not implemented yet | Registered as a placeholder custom transport. |
+| `responses-websocket` | Supported | Uses Mixlayer's Responses API over WebSocket with full context sent on every turn. |
 | `responses-websocket-delta` | Not implemented yet | Reserved for future WebSocket delta support. |
 
 Transport resolution order is:
@@ -62,7 +62,7 @@ For a persistent setting inside Pi:
 
 Then reload extensions or restart Pi for the new transport to take effect. Run `/mixlayer-transport` with no argument to show the current configured transport.
 
-The `responses-sse` transport strips Mixlayer-incompatible Responses request fields before sending and disables Pi's `session_id` request header, which Mixlayer rejects. It still sends `x-client-request-id` for request affinity.
+The Responses transports strip Mixlayer-incompatible request fields before sending and disable Pi's `session_id` request header, which Mixlayer rejects. They still send `x-client-request-id` for request affinity. The `responses-websocket` transport does not use `previous_response_id` yet, so it sends the full conversation context each turn.
 
 ## Debug Logging
 

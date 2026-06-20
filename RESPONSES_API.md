@@ -118,6 +118,17 @@ Live testing with the Mixlayer endpoint also showed that `session_id` request he
 
 **Deliverable:** Mixlayer models can stream Responses over WebSocket with full context per turn.
 
+**Status:** Implemented for `responses-websocket` via a custom `streamSimple` handler. The handler:
+- Builds a full Responses request body from Pi context on every turn.
+- Opens `wss://models.mixlayer.ai/v1/responses`.
+- Sends `{ type: "response.create", ...payload }`.
+- Omits the HTTP/SSE-only `stream` request field, which Mixlayer rejects on WebSocket requests.
+- Applies the same Mixlayer payload sanitizer used by `responses-sse`.
+- Parses Responses WebSocket events into Pi's `AssistantMessageEventStream` protocol.
+- Handles connection errors, aborts, early closes, and nested provider error frames.
+
+Live testing confirmed `responses-websocket` returns the expected output for a basic Pi print-mode request. It does not use `previous_response_id`; delta support remains Phase 4.
+
 ### Phase 4: Delta Updates over WebSocket
 
 - Enable once the server supports `previous_response_id` and delta updates.

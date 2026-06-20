@@ -12,12 +12,15 @@ import {
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { createResponsesWebSocketStreamSimple } from "./responses-websocket.js";
 
 const MIXLAYER_PROVIDER_ID = "mixlayer";
 const MIXLAYER_PROVIDER_NAME = "Mixlayer";
 const MIXLAYER_BASE_URL = "https://models.mixlayer.ai/v1";
 const MIXLAYER_MODELS_URL = "https://models.mixlayer.ai/_openrouter/models";
 const MIXLAYER_RESPONSES_SSE_API = "mixlayer-responses-sse";
+const MIXLAYER_RESPONSES_WEBSOCKET_API = "mixlayer-responses-websocket";
+const MIXLAYER_RESPONSES_WEBSOCKET_DELTA_API = "mixlayer-responses-websocket-delta";
 const MIXLAYER_DEBUG_LOGS_ENV = "MIXLAYER_DEBUG_LOGS";
 const MIXLAYER_REQUEST_LOG_PATH = "/tmp/mixlayer-debug.log";
 const MIXLAYER_RESPONSE_LOG_PATH = "/tmp/mixlayer-response.log";
@@ -289,9 +292,9 @@ function toProviderApi(transport: MixlayerTransport): Api {
 		case "responses-sse":
 			return MIXLAYER_RESPONSES_SSE_API;
 		case "responses-websocket":
-			return "mixlayer-responses-websocket";
+			return MIXLAYER_RESPONSES_WEBSOCKET_API;
 		case "responses-websocket-delta":
-			return "mixlayer-responses-websocket-delta";
+			return MIXLAYER_RESPONSES_WEBSOCKET_DELTA_API;
 	}
 }
 
@@ -364,7 +367,12 @@ function sanitizeMixlayerResponsesPayload(payload: unknown): unknown {
 }
 
 function isMixlayerResponsesApi(api: Api | undefined): boolean {
-	return api === MIXLAYER_RESPONSES_SSE_API || api === "openai-responses";
+	return (
+		api === MIXLAYER_RESPONSES_SSE_API ||
+		api === MIXLAYER_RESPONSES_WEBSOCKET_API ||
+		api === MIXLAYER_RESPONSES_WEBSOCKET_DELTA_API ||
+		api === "openai-responses"
+	);
 }
 
 function selectDefaultModel(models: ProviderModelConfig[]): ProviderModelConfig {
@@ -437,7 +445,9 @@ export default async function mixlayerExtension(pi: ExtensionAPI): Promise<void>
 
 	if (transport === "responses-sse") {
 		providerConfig.streamSimple = createResponsesSseStreamSimple();
-	} else if (transport === "responses-websocket" || transport === "responses-websocket-delta") {
+	} else if (transport === "responses-websocket") {
+		providerConfig.streamSimple = createResponsesWebSocketStreamSimple(sanitizeMixlayerResponsesPayload);
+	} else if (transport === "responses-websocket-delta") {
 		providerConfig.streamSimple = createNotImplementedStreamSimple(transport);
 	}
 

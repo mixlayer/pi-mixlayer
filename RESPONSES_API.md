@@ -72,6 +72,11 @@ The extension should support at least these transports:
 
 **Deliverable:** Extension builds and passes type checks; no functional change for the default transport.
 
+**Status:** Implemented. Transport is read from `MIXLAYER_TRANSPORT` env var, then `~/.pi/agent/mixlayer-settings.json`, then defaults to `chat-completions`. The `/mixlayer-transport` slash command writes the settings file. The resolved transport is wired into `registerProvider`:
+- `chat-completions` → `api: "openai-completions"`
+- `responses-sse` → custom `api: "mixlayer-responses-sse"` that delegates to Pi's `openai-responses` implementation with Mixlayer payload sanitization
+- `responses-websocket` / `responses-websocket-delta` → custom API with a placeholder `streamSimple` (to be implemented in Phases 3 and 4).
+
 ### Phase 2: Responses over HTTP/SSE
 
 - For models resolved to `responses-sse`, register them with:
@@ -90,6 +95,14 @@ The extension should support at least these transports:
 - Test streaming text, tool calls, and reasoning if supported.
 
 **Deliverable:** Mixlayer models can be used with Responses API over HTTP/SSE.
+
+**Status:** Implemented via a custom `mixlayer-responses-sse` API alias. The handler delegates to Pi's `streamSimpleOpenAIResponses()`, preserves Pi's normal `before_provider_request` hook, then strips Mixlayer-incompatible payload fields immediately before the OpenAI SDK sends the request:
+- top-level `include`
+- top-level `prompt_cache_retention`
+- `reasoning.summary`
+- `reasoning.generate_summary`
+
+Live testing with the Mixlayer endpoint also showed that `session_id` request headers return HTTP 400, while `x-client-request-id` is accepted. Responses transports therefore set `compat.sendSessionIdHeader: false`.
 
 ### Phase 3: Responses over WebSocket
 

@@ -1,4 +1,14 @@
 import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
+import {
+	createAssistantMessageEventStream,
+	type Api,
+	type AssistantMessage,
+	type AssistantMessageEventStream,
+	type Context,
+	type Model,
+	type SimpleStreamOptions,
+	streamSimpleOpenAIResponses,
+} from "@earendil-works/pi-ai";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +17,10 @@ const MIXLAYER_PROVIDER_ID = "mixlayer";
 const MIXLAYER_PROVIDER_NAME = "Mixlayer";
 const MIXLAYER_BASE_URL = "https://models.mixlayer.ai/v1";
 const MIXLAYER_MODELS_URL = "https://models.mixlayer.ai/_openrouter/models";
+const MIXLAYER_RESPONSES_SSE_API = "mixlayer-responses-sse";
+const MIXLAYER_DEBUG_LOGS_ENV = "MIXLAYER_DEBUG_LOGS";
+const MIXLAYER_REQUEST_LOG_PATH = "/tmp/mixlayer-debug.log";
+const MIXLAYER_RESPONSE_LOG_PATH = "/tmp/mixlayer-response.log";
 const MIXLAYER_DEFAULT_MODEL_IDS = ["qwen/qwen3.5-397b-a17b", "qwen/qwen3.6-35b-a3b"];
 const DEFAULT_CONTEXT_WINDOW = 128000;
 const DEFAULT_MAX_TOKENS = 4096;
@@ -245,6 +259,11 @@ function resolveTransport(settings: PiSettings): MixlayerTransport {
 	return "chat-completions";
 }
 
+function isDebugLoggingEnabled(): boolean {
+	const value = process.env[MIXLAYER_DEBUG_LOGS_ENV]?.toLowerCase();
+	return value === "1" || value === "true" || value === "yes";
+}
+
 function pricePerMillion(value: string | undefined): number {
 	const parsed = parseNumber(value);
 	return parsed === undefined ? 0 : parsed * 1_000_000;
@@ -263,8 +282,21 @@ function mapInputModalities(inputModalities: string[] | undefined): ("text" | "i
 	return Array.from(input);
 }
 
-function toProviderModel(model: MixlayerModel): ProviderModelConfig {
-	return {
+function toProviderApi(transport: MixlayerTransport): Api {
+	switch (transport) {
+		case "chat-completions":
+			return "openai-completions";
+		case "responses-sse":
+			return MIXLAYER_RESPONSES_SSE_API;
+		case "responses-websocket":
+			return "mixlayer-responses-websocket";
+		case "responses-websocket-delta":
+			return "mixlayer-responses-websocket-delta";
+	}
+}
+
+function toProviderModel(model: MixlayerModel, transport: MixlayerTransport): ProviderModelConfig {
+	const base = {
 		id: model.id,
 		name: model.name ?? model.id,
 		reasoning: model.supported_features?.includes("reasoning") ?? false,
@@ -277,12 +309,62 @@ function toProviderModel(model: MixlayerModel): ProviderModelConfig {
 		},
 		contextWindow: model.context_length ?? DEFAULT_CONTEXT_WINDOW,
 		maxTokens: model.max_output_length ?? DEFAULT_MAX_TOKENS,
+	};
+
+	if (transport === "chat-completions") {
+		return {
+			...base,
+			compat: {
+				supportsDeveloperRole: false,
+				supportsUsageInStreaming: true,
+				maxTokensField: "max_tokens",
+			},
+		};
+	}
+
+	return {
+		...base,
 		compat: {
 			supportsDeveloperRole: false,
-			supportsUsageInStreaming: true,
-			maxTokensField: "max_tokens",
+			// Mixlayer rejects the underscore-containing `session_id` header.
+			sendSessionIdHeader: false,
+			// Mixlayer rejects `prompt_cache_retention` as an unknown parameter.
+			supportsLongCacheRetention: false,
 		},
 	};
+}
+
+function sanitizeMixlayerResponsesPayload(payload: unknown): unknown {
+	if (!isRecord(payload)) {
+		return payload;
+	}
+
+	const sanitized: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(payload)) {
+		if (key === "include") {
+			// Mixlayer rejects non-empty `include` arrays.
+			continue;
+		}
+		if (key === "prompt_cache_retention") {
+			// Mixlayer rejects `prompt_cache_retention` as an unknown parameter.
+			continue;
+		}
+		if (key === "reasoning" && isRecord(value)) {
+			// Mixlayer rejects `reasoning.summary` and `reasoning.generate_summary`.
+			const { summary: _summary, generate_summary: _generateSummary, ...rest } = value;
+			if (Object.keys(rest).length > 0) {
+				sanitized[key] = rest;
+			}
+			continue;
+		}
+		sanitized[key] = value;
+	}
+
+	return sanitized;
+}
+
+function isMixlayerResponsesApi(api: Api | undefined): boolean {
+	return api === MIXLAYER_RESPONSES_SSE_API || api === "openai-responses";
 }
 
 function selectDefaultModel(models: ProviderModelConfig[]): ProviderModelConfig {
@@ -295,20 +377,104 @@ function selectDefaultModel(models: ProviderModelConfig[]): ProviderModelConfig 
 	return models[0];
 }
 
+function createResponsesSseStreamSimple() {
+	return (model: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream => {
+		return streamSimpleOpenAIResponses(model as Model<"openai-responses">, context, {
+			...options,
+			async onPayload(payload, payloadModel) {
+				const nextPayload = await options?.onPayload?.(payload, payloadModel);
+				return sanitizeMixlayerResponsesPayload(nextPayload ?? payload);
+			},
+		});
+	};
+}
+
+function createNotImplementedStreamSimple(transport: MixlayerTransport) {
+	return (_model: Model<Api>, _context: Context, _options?: SimpleStreamOptions): AssistantMessageEventStream => {
+		const stream = createAssistantMessageEventStream();
+		(async () => {
+			const output: AssistantMessage = {
+				role: "assistant",
+				content: [],
+				api: _model.api,
+				provider: _model.provider,
+				model: _model.id,
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "error",
+				timestamp: Date.now(),
+				errorMessage: `Mixlayer transport "${transport}" is not implemented yet.`,
+			};
+			stream.push({ type: "error", reason: "error", error: output });
+			stream.end();
+		})();
+		return stream;
+	};
+}
+
 export default async function mixlayerExtension(pi: ExtensionAPI): Promise<void> {
 	const mixlayerModels = await fetchModelsWithCache();
-	const models = mixlayerModels.map(toProviderModel);
-	const defaultModel = selectDefaultModel(models);
 
 	const settings = await readSettings();
 	const transport = resolveTransport(settings);
 
-	pi.registerProvider(MIXLAYER_PROVIDER_ID, {
+	const models = mixlayerModels.map((model) => toProviderModel(model, transport));
+	const defaultModel = selectDefaultModel(models);
+
+	const providerConfig: Parameters<ExtensionAPI["registerProvider"]>[1] = {
 		name: MIXLAYER_PROVIDER_NAME,
 		baseUrl: MIXLAYER_BASE_URL,
 		apiKey: "$MIXLAYER_API_KEY",
-		api: "openai-completions",
+		api: toProviderApi(transport),
 		models,
+	};
+
+	if (transport === "responses-sse") {
+		providerConfig.streamSimple = createResponsesSseStreamSimple();
+	} else if (transport === "responses-websocket" || transport === "responses-websocket-delta") {
+		providerConfig.streamSimple = createNotImplementedStreamSimple(transport);
+	}
+
+	pi.registerProvider(MIXLAYER_PROVIDER_ID, providerConfig);
+
+	pi.on("before_provider_request", (_event, ctx) => {
+		if (ctx.model?.provider !== MIXLAYER_PROVIDER_ID) {
+			return;
+		}
+
+		if (isMixlayerResponsesApi(ctx.model?.api)) {
+			const sanitized = sanitizeMixlayerResponsesPayload(_event.payload);
+			if (isDebugLoggingEnabled()) {
+				void writeFile(
+					MIXLAYER_REQUEST_LOG_PATH,
+					JSON.stringify({ original: _event.payload, sanitized }, null, 2),
+					"utf8",
+				).catch(() => {});
+			}
+			return sanitized;
+		}
+
+		return;
+	});
+
+	pi.on("after_provider_response", (_event, ctx) => {
+		if (ctx.model?.provider !== MIXLAYER_PROVIDER_ID) {
+			return;
+		}
+		if (!isDebugLoggingEnabled()) {
+			return;
+		}
+		void writeFile(
+			MIXLAYER_RESPONSE_LOG_PATH,
+			JSON.stringify({ status: _event.status, headers: _event.headers }, null, 2),
+			"utf8",
+		).catch(() => {});
 	});
 
 	pi.registerCommand("mixlayer-transport", {

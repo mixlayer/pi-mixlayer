@@ -27,6 +27,7 @@ const MIXLAYER_RESPONSE_LOG_PATH = "/tmp/mixlayer-response.log";
 const MIXLAYER_DEFAULT_MODEL_IDS = ["qwen/qwen3.5-397b-a17b", "qwen/qwen3.6-35b-a3b"];
 const DEFAULT_CONTEXT_WINDOW = 128000;
 const DEFAULT_MAX_TOKENS = 4096;
+const MODELS_FETCH_TIMEOUT_MS = 10_000;
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 const MIXLAYER_TRANSPORTS = [
@@ -174,13 +175,30 @@ async function writeCache(models: MixlayerModel[]): Promise<void> {
 }
 
 async function fetchModels(): Promise<MixlayerModel[]> {
-	const response = await fetch(MIXLAYER_MODELS_URL);
-	if (!response.ok) {
-		throw new Error(`Failed to fetch Mixlayer models: ${response.status} ${response.statusText}`);
+	const controller = new AbortController();
+	const timeout = setTimeout(() => {
+		controller.abort();
+	}, MODELS_FETCH_TIMEOUT_MS);
+	if (typeof timeout === "object" && "unref" in timeout && typeof timeout.unref === "function") {
+		timeout.unref();
 	}
 
-	const payload = parseModelsResponse(await response.json());
-	return payload.data;
+	try {
+		const response = await fetch(MIXLAYER_MODELS_URL, { signal: controller.signal });
+		if (!response.ok) {
+			throw new Error(`Failed to fetch Mixlayer models: ${response.status} ${response.statusText}`);
+		}
+
+		const payload = parseModelsResponse(await response.json());
+		return payload.data;
+	} catch (error) {
+		if (controller.signal.aborted) {
+			throw new Error(`Timed out fetching Mixlayer models after ${MODELS_FETCH_TIMEOUT_MS}ms`);
+		}
+		throw error;
+	} finally {
+		clearTimeout(timeout);
+	}
 }
 
 async function fetchModelsWithCache(): Promise<MixlayerModel[]> {

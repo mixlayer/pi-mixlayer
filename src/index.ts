@@ -12,7 +12,7 @@ import {
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { createResponsesWebSocketStreamSimple } from "./responses-websocket.js";
+import { createResponsesWebSocketStreamSimple, type ResponsesWebSocketStatsEvent } from "./responses-websocket.js";
 
 const MIXLAYER_PROVIDER_ID = "mixlayer";
 const MIXLAYER_PROVIDER_NAME = "Mixlayer";
@@ -69,8 +69,198 @@ interface PiSettings {
 	};
 }
 
+interface MixlayerStats {
+	startedAt: string;
+	providerRequests: {
+		total: number;
+		byApi: Record<string, number>;
+		byModel: Record<string, number>;
+		httpResponses: number;
+		httpResponseErrors: number;
+		httpStatuses: Record<string, number>;
+	};
+	turns: {
+		started: number;
+		ended: number;
+		completed: number;
+		errored: number;
+		aborted: number;
+		toolUse: number;
+		byModel: Record<string, number>;
+	};
+	websocket: {
+		streams: number;
+		deltaEnabledStreams: number;
+		cacheableStreams: number;
+		deltaDisabledStreams: number;
+		requests: number;
+		successfulRequests: number;
+		failedRequests: number;
+		fullRequests: number;
+		deltaRequests: number;
+		retryRequests: number;
+		deltaFailures: number;
+		deltaRecoverableFailures: number;
+		deltaDisabled: number;
+	};
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
+}
+
+function createMixlayerStats(): MixlayerStats {
+	return {
+		startedAt: new Date().toISOString(),
+		providerRequests: {
+			total: 0,
+			byApi: {},
+			byModel: {},
+			httpResponses: 0,
+			httpResponseErrors: 0,
+			httpStatuses: {},
+		},
+		turns: {
+			started: 0,
+			ended: 0,
+			completed: 0,
+			errored: 0,
+			aborted: 0,
+			toolUse: 0,
+			byModel: {},
+		},
+		websocket: {
+			streams: 0,
+			deltaEnabledStreams: 0,
+			cacheableStreams: 0,
+			deltaDisabledStreams: 0,
+			requests: 0,
+			successfulRequests: 0,
+			failedRequests: 0,
+			fullRequests: 0,
+			deltaRequests: 0,
+			retryRequests: 0,
+			deltaFailures: 0,
+			deltaRecoverableFailures: 0,
+			deltaDisabled: 0,
+		},
+	};
+}
+
+function resetMixlayerStats(stats: MixlayerStats): void {
+	Object.assign(stats, createMixlayerStats());
+}
+
+function incrementCounter(map: Record<string, number>, key: string | undefined): void {
+	map[key && key.length > 0 ? key : "unknown"] = (map[key && key.length > 0 ? key : "unknown"] ?? 0) + 1;
+}
+
+function formatCounterMap(map: Record<string, number>): string {
+	const entries = Object.entries(map).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+	if (entries.length === 0) {
+		return "(none)";
+	}
+	return entries.map(([key, value]) => `${key}=${value}`).join(", ");
+}
+
+function formatPercent(numerator: number, denominator: number): string {
+	if (denominator <= 0) {
+		return "0.0%";
+	}
+	return `${((numerator / denominator) * 100).toFixed(1)}%`;
+}
+
+function formatMixlayerStats(stats: MixlayerStats, transport: MixlayerTransport): string {
+	const websocket = stats.websocket;
+	return [
+		"Mixlayer stats",
+		`Since: ${stats.startedAt}`,
+		`Transport: ${transport}`,
+		"",
+		"Turns:",
+		`  started: ${stats.turns.started}`,
+		`  ended: ${stats.turns.ended}`,
+		`  completed: ${stats.turns.completed}`,
+		`  tool_use: ${stats.turns.toolUse}`,
+		`  errored: ${stats.turns.errored}`,
+		`  aborted: ${stats.turns.aborted}`,
+		`  by_model: ${formatCounterMap(stats.turns.byModel)}`,
+		"",
+		"Provider requests:",
+		`  total: ${stats.providerRequests.total}`,
+		`  by_api: ${formatCounterMap(stats.providerRequests.byApi)}`,
+		`  by_model: ${formatCounterMap(stats.providerRequests.byModel)}`,
+		`  http_responses: ${stats.providerRequests.httpResponses}`,
+		`  http_response_errors: ${stats.providerRequests.httpResponseErrors}`,
+		`  http_statuses: ${formatCounterMap(stats.providerRequests.httpStatuses)}`,
+		"",
+		"WebSocket:",
+		`  streams: ${websocket.streams}`,
+		`  delta_enabled_streams: ${websocket.deltaEnabledStreams}`,
+		`  cacheable_streams: ${websocket.cacheableStreams}`,
+		`  delta_disabled_streams: ${websocket.deltaDisabledStreams}`,
+		`  requests: ${websocket.requests}`,
+		`  successful_requests: ${websocket.successfulRequests}`,
+		`  failed_requests: ${websocket.failedRequests}`,
+		`  full_requests: ${websocket.fullRequests}`,
+		`  delta_requests: ${websocket.deltaRequests}`,
+		`  delta_hit_rate: ${formatPercent(websocket.deltaRequests, websocket.requests)}`,
+		`  retry_requests: ${websocket.retryRequests}`,
+		`  delta_failures: ${websocket.deltaFailures}`,
+		`  delta_recoverable_failures: ${websocket.deltaRecoverableFailures}`,
+		`  delta_disabled: ${websocket.deltaDisabled}`,
+	].join("\n");
+}
+
+function recordWebSocketStats(stats: MixlayerStats, event: ResponsesWebSocketStatsEvent): void {
+	switch (event.type) {
+		case "stream_started":
+			stats.websocket.streams++;
+			if (event.deltaEnabled) {
+				stats.websocket.deltaEnabledStreams++;
+			}
+			if (event.cacheable) {
+				stats.websocket.cacheableStreams++;
+			}
+			if (event.deltaDisabled) {
+				stats.websocket.deltaDisabledStreams++;
+			}
+			break;
+		case "request_started":
+			stats.websocket.requests++;
+			if (event.requestKind === "delta") {
+				stats.websocket.deltaRequests++;
+			} else {
+				stats.websocket.fullRequests++;
+			}
+			if (event.retry) {
+				stats.websocket.retryRequests++;
+			}
+			break;
+		case "request_finished":
+			if (event.ok) {
+				stats.websocket.successfulRequests++;
+			} else {
+				stats.websocket.failedRequests++;
+				if (event.requestKind === "delta") {
+					stats.websocket.deltaFailures++;
+					if (event.recoverable) {
+						stats.websocket.deltaRecoverableFailures++;
+					}
+				}
+			}
+			break;
+		case "delta_disabled":
+			stats.websocket.deltaDisabled++;
+			break;
+	}
+}
+
+function getStopReason(message: unknown): string | undefined {
+	if (!isRecord(message)) {
+		return undefined;
+	}
+	return typeof message.stopReason === "string" ? message.stopReason : undefined;
 }
 
 function parseNumber(value: unknown): number | undefined {
@@ -445,6 +635,10 @@ function createNotImplementedStreamSimple(transport: MixlayerTransport) {
 }
 
 export default async function mixlayerExtension(pi: ExtensionAPI): Promise<void> {
+	const stats = createMixlayerStats();
+	const onWebSocketStats = (event: ResponsesWebSocketStatsEvent) => {
+		recordWebSocketStats(stats, event);
+	};
 	const mixlayerModels = await fetchModelsWithCache();
 
 	const settings = await readSettings();
@@ -464,9 +658,12 @@ export default async function mixlayerExtension(pi: ExtensionAPI): Promise<void>
 	if (transport === "responses-sse") {
 		providerConfig.streamSimple = createResponsesSseStreamSimple();
 	} else if (transport === "responses-websocket") {
-		providerConfig.streamSimple = createResponsesWebSocketStreamSimple(sanitizeMixlayerResponsesPayload);
+		providerConfig.streamSimple = createResponsesWebSocketStreamSimple(sanitizeMixlayerResponsesPayload, { onStats: onWebSocketStats });
 	} else if (transport === "responses-websocket-delta") {
-		providerConfig.streamSimple = createResponsesWebSocketStreamSimple(sanitizeMixlayerResponsesPayload, { delta: true });
+		providerConfig.streamSimple = createResponsesWebSocketStreamSimple(sanitizeMixlayerResponsesPayload, {
+			delta: true,
+			onStats: onWebSocketStats,
+		});
 	}
 
 	pi.registerProvider(MIXLAYER_PROVIDER_ID, providerConfig);
@@ -475,6 +672,10 @@ export default async function mixlayerExtension(pi: ExtensionAPI): Promise<void>
 		if (ctx.model?.provider !== MIXLAYER_PROVIDER_ID) {
 			return;
 		}
+
+		stats.providerRequests.total++;
+		incrementCounter(stats.providerRequests.byApi, ctx.model.api);
+		incrementCounter(stats.providerRequests.byModel, ctx.model.id);
 
 		if (isMixlayerResponsesApi(ctx.model?.api)) {
 			const sanitized = sanitizeMixlayerResponsesPayload(_event.payload);
@@ -495,6 +696,11 @@ export default async function mixlayerExtension(pi: ExtensionAPI): Promise<void>
 		if (ctx.model?.provider !== MIXLAYER_PROVIDER_ID) {
 			return;
 		}
+		stats.providerRequests.httpResponses++;
+		incrementCounter(stats.providerRequests.httpStatuses, String(_event.status));
+		if (_event.status >= 400) {
+			stats.providerRequests.httpResponseErrors++;
+		}
 		if (!isDebugLoggingEnabled()) {
 			return;
 		}
@@ -503,6 +709,31 @@ export default async function mixlayerExtension(pi: ExtensionAPI): Promise<void>
 			JSON.stringify({ status: _event.status, headers: _event.headers }, null, 2),
 			"utf8",
 		).catch(() => {});
+	});
+
+	pi.on("turn_start", (_event, ctx) => {
+		if (ctx.model?.provider !== MIXLAYER_PROVIDER_ID) {
+			return;
+		}
+		stats.turns.started++;
+		incrementCounter(stats.turns.byModel, ctx.model.id);
+	});
+
+	pi.on("turn_end", (_event, ctx) => {
+		if (ctx.model?.provider !== MIXLAYER_PROVIDER_ID) {
+			return;
+		}
+		stats.turns.ended++;
+		const stopReason = getStopReason(_event.message);
+		if (stopReason === "error") {
+			stats.turns.errored++;
+		} else if (stopReason === "aborted") {
+			stats.turns.aborted++;
+		} else if (stopReason === "toolUse") {
+			stats.turns.toolUse++;
+		} else {
+			stats.turns.completed++;
+		}
 	});
 
 	pi.registerCommand("mixlayer-transport", {
@@ -526,6 +757,27 @@ export default async function mixlayerExtension(pi: ExtensionAPI): Promise<void>
 
 			await writeSettings({ mixlayer: { transport } });
 			ctx.ui.notify(`Mixlayer transport set to ${transport}. Reload extensions to apply.`, "info");
+		},
+	});
+
+	pi.registerCommand("mixlayer-stats", {
+		description: "Show Mixlayer request, turn, and WebSocket delta counters. Use /mixlayer-stats reset to clear.",
+		getArgumentCompletions(prefix) {
+			return "reset".startsWith(prefix) ? [{ value: "reset", label: "reset", description: "Clear Mixlayer stats counters" }] : [];
+		},
+		async handler(args, ctx) {
+			const trimmed = args.trim();
+			if (trimmed === "reset") {
+				resetMixlayerStats(stats);
+				ctx.ui.notify("Mixlayer stats reset.", "info");
+				return;
+			}
+			if (trimmed) {
+				ctx.ui.notify("Usage: /mixlayer-stats [reset]", "error");
+				return;
+			}
+
+			ctx.ui.notify(formatMixlayerStats(stats, transport), "info");
 		},
 	});
 

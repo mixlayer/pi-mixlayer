@@ -35,7 +35,7 @@ The extension should support at least these transports:
 1. `chat-completions` — current behavior, `api: "openai-completions"`.
 2. `responses-sse` — Responses API over HTTP/SSE via Pi's built-in `openai-responses` provider.
 3. `responses-websocket` — Responses API over WebSocket with full context per turn.
-4. `responses-websocket-delta` — Responses API over WebSocket with delta updates and connection caching (server support pending).
+4. `responses-websocket-delta` — Responses API over WebSocket with conservative delta updates and connection caching.
 
 ## Phases
 
@@ -75,7 +75,8 @@ The extension should support at least these transports:
 **Status:** Implemented. Transport is read from `MIXLAYER_TRANSPORT` env var, then `~/.pi/agent/mixlayer-settings.json`, then defaults to `chat-completions`. The `/mixlayer-transport` slash command writes the settings file. The resolved transport is wired into `registerProvider`:
 - `chat-completions` → `api: "openai-completions"`
 - `responses-sse` → custom `api: "mixlayer-responses-sse"` that delegates to Pi's `openai-responses` implementation with Mixlayer payload sanitization
-- `responses-websocket` / `responses-websocket-delta` → custom API with a placeholder `streamSimple` (to be implemented in Phases 3 and 4).
+- `responses-websocket` → custom API with full-context WebSocket streaming
+- `responses-websocket-delta` → custom API with WebSocket streaming and safe delta fallback
 
 ### Phase 2: Responses over HTTP/SSE
 
@@ -150,7 +151,54 @@ Live testing confirmed `responses-websocket` returns the expected output for a b
 - Store the assistant's response items after each successful turn for use in the next delta computation.
 - Add session cleanup (close idle connections, clear cache on shutdown).
 
+**Delta safety model:**
+
+Delta updates must be treated as a cache optimization only. Every turn should first build the full sanitized Responses request body exactly as the non-delta WebSocket transport would send it. The extension should send a delta only when it can prove that the current full request is an append-only continuation of the cached previous request plus the previous assistant response.
+
+Recommended flow:
+
+1. Build the full sanitized request body for the current turn.
+2. If there is no cached session state or no cached `previous_response_id`, send the full body.
+3. Compare the current body with the cached previous body excluding only `input` and `previous_response_id`.
+4. Build the expected input prefix as `previousRequest.input + previousAssistantResponseItems`.
+5. If the current `input` does not start with that exact prefix, send the full body.
+6. Otherwise send the suffix as the delta input with `previous_response_id`.
+
+This means system prompt changes are handled naturally when the system prompt is represented as the first `developer` or `system` item in `input`: the prefix check fails and the extension sends full context. If the system prompt later moves to top-level `instructions`, the body comparison excluding `input` catches the change instead.
+
+Cache per `sessionId`:
+
+```ts
+{
+  socket,
+  lastRequestBody,      // full sanitized body from the last successful turn
+  lastResponseId,       // response.id from response.completed
+  lastResponseItems,    // previous assistant response converted back to Responses input items
+}
+```
+
+Always fall back to full context when:
+
+- the system prompt or top-level `instructions` changed,
+- tools changed,
+- model, provider, or base URL changed,
+- reasoning effort, temperature, max tokens, or other non-input parameters changed,
+- the conversation was compacted, branched, edited, or truncated,
+- no `previous_response_id` is available,
+- the previous request failed or was aborted,
+- socket or cache state is missing, stale, or not reusable,
+- the delta is empty or cannot be computed confidently.
+
 **Deliverable:** Mixlayer models can stream Responses over WebSocket with delta updates, reducing per-turn payload size.
+
+**Status:** Implemented for `responses-websocket-delta`. The handler:
+- Caches a reusable WebSocket and continuation state per `sessionId`.
+- Builds the full sanitized request body every turn before deciding whether to send a delta.
+- Sends a delta only when the current request body matches the previous request body outside `input`, and the current `input` starts with `previousRequest.input + previousAssistantResponseItems`.
+- Falls back to full context for first turns, changed prompts/tools/model/options, compacted or branched context, missing cache state, empty deltas, or failed confidence checks.
+- Stores `response.id` and assistant response items after successful turns for the next delta computation.
+- Clears continuation state on failed or aborted requests.
+- Retries once with full context and disables delta for the session if a delta request fails with a recoverable `previous_response_id`/unsupported-parameter error.
 
 ### Phase 5: Polish and Defaults
 

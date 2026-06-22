@@ -466,7 +466,7 @@ export default async function mixlayerExtension(pi: ExtensionAPI): Promise<void>
 	} else if (transport === "responses-websocket") {
 		providerConfig.streamSimple = createResponsesWebSocketStreamSimple(sanitizeMixlayerResponsesPayload);
 	} else if (transport === "responses-websocket-delta") {
-		providerConfig.streamSimple = createNotImplementedStreamSimple(transport);
+		providerConfig.streamSimple = createResponsesWebSocketStreamSimple(sanitizeMixlayerResponsesPayload, { delta: true });
 	}
 
 	pi.registerProvider(MIXLAYER_PROVIDER_ID, providerConfig);

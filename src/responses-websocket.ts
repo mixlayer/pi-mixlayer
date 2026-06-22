@@ -29,7 +29,16 @@ type PayloadSanitizer = (payload: unknown) => unknown;
 
 interface ResponsesWebSocketStreamOptions {
 	delta?: boolean;
+	onStats?: (event: ResponsesWebSocketStatsEvent) => void;
 }
+
+type ResponsesWebSocketRequestKind = "full" | "delta";
+
+export type ResponsesWebSocketStatsEvent =
+	| { type: "stream_started"; deltaEnabled: boolean; cacheable: boolean; deltaDisabled: boolean; sessionId?: string }
+	| { type: "request_started"; requestKind: ResponsesWebSocketRequestKind; retry: boolean }
+	| { type: "request_finished"; requestKind: ResponsesWebSocketRequestKind; retry: boolean; ok: boolean; recoverable: boolean }
+	| { type: "delta_disabled"; sessionId: string };
 
 interface WebSocketLike {
 	readonly readyState?: number;
@@ -975,6 +984,14 @@ function isRecoverableDeltaError(error: unknown): boolean {
 	return /previous_response|previous_response_id|unsupported_parameter/i.test(message);
 }
 
+function emitWebSocketStats(streamOptions: ResponsesWebSocketStreamOptions, event: ResponsesWebSocketStatsEvent): void {
+	try {
+		streamOptions.onStats?.(event);
+	} catch {
+		// Stats must never affect request handling.
+	}
+}
+
 async function processResponsesStream<TApi extends Api>(
 	openaiStream: AsyncIterable<ResponsesStreamEvent>,
 	output: AssistantMessage,
@@ -1213,7 +1230,9 @@ export function createResponsesWebSocketStreamSimple(sanitizePayload: PayloadSan
 				const idleTimeoutMs = normalizeTimeoutMs(options?.timeoutMs);
 				const sessionId = options?.sessionId;
 				const deltaEnabled = streamOptions.delta === true;
-				const cacheable = deltaEnabled && !!sessionId && !deltaDisabledSessions.has(sessionId);
+				const deltaDisabled = !!sessionId && deltaDisabledSessions.has(sessionId);
+				const cacheable = deltaEnabled && !!sessionId && !deltaDisabled;
+				emitWebSocketStats(streamOptions, { type: "stream_started", deltaEnabled, cacheable, deltaDisabled, sessionId });
 				lease = await acquireWebSocket(
 					resolveResponsesWebSocketUrl(model.baseUrl),
 					buildWebSocketHeaders(model, apiKey, options),
@@ -1224,19 +1243,32 @@ export function createResponsesWebSocketStreamSimple(sanitizePayload: PayloadSan
 				);
 
 				let requestBody = cacheable ? buildDeltaRequestBody(fullRequestBody, lease.entry?.continuation) : undefined;
-				let sentDelta = requestBody !== undefined;
+				let requestKind: ResponsesWebSocketRequestKind = requestBody !== undefined ? "delta" : "full";
 				requestBody ??= fullRequestBody;
+
+				const sendTrackedRequest = async (body: ResponsesPayload, kind: ResponsesWebSocketRequestKind, retry: boolean) => {
+					emitWebSocketStats(streamOptions, { type: "request_started", requestKind: kind, retry });
+					try {
+						await sendResponsesWebSocketRequest(lease!.socket, body, output, stream, model, options, idleTimeoutMs);
+						emitWebSocketStats(streamOptions, { type: "request_finished", requestKind: kind, retry, ok: true, recoverable: false });
+					} catch (error) {
+						const recoverable = kind === "delta" && output.content.length === 0 && isRecoverableDeltaError(error);
+						emitWebSocketStats(streamOptions, { type: "request_finished", requestKind: kind, retry, ok: false, recoverable });
+						throw error;
+					}
+				};
 
 				stream.push({ type: "start", partial: output });
 				try {
-					await sendResponsesWebSocketRequest(lease.socket, requestBody, output, stream, model, options, idleTimeoutMs);
+					await sendTrackedRequest(requestBody, requestKind, false);
 				} catch (error) {
-					if (!sentDelta || output.content.length > 0 || !isRecoverableDeltaError(error)) {
+					if (requestKind !== "delta" || output.content.length > 0 || !isRecoverableDeltaError(error)) {
 						throw error;
 					}
 
 					if (sessionId) {
 						deltaDisabledSessions.add(sessionId);
+						emitWebSocketStats(streamOptions, { type: "delta_disabled", sessionId });
 					}
 					if (lease.entry) {
 						lease.entry.continuation = undefined;
@@ -1251,9 +1283,9 @@ export function createResponsesWebSocketStreamSimple(sanitizePayload: PayloadSan
 						connectTimeoutMs,
 						false,
 					);
-					sentDelta = false;
+					requestKind = "full";
 					requestBody = fullRequestBody;
-					await sendResponsesWebSocketRequest(lease.socket, requestBody, output, stream, model, options, idleTimeoutMs);
+					await sendTrackedRequest(requestBody, requestKind, true);
 				}
 
 				if (options?.signal?.aborted) {

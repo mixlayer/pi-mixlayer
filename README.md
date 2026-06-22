@@ -64,6 +64,22 @@ Then reload extensions or restart Pi for the new transport to take effect. Run `
 
 The Responses transports strip Mixlayer-incompatible request fields before sending and disable Pi's `session_id` request header, which Mixlayer rejects. They still send `x-client-request-id` for request affinity. The `responses-websocket` transport sends the full conversation context each turn. The `responses-websocket-delta` transport first builds the full request, then sends a delta only when the current request is an exact append-only continuation of the cached previous request and response.
 
+## Stats Counters
+
+Run this inside Pi to print in-memory Mixlayer counters for the current extension process:
+
+```text
+/mixlayer-stats
+```
+
+The output includes Mixlayer turn counts, logical provider request counts, HTTP response status counts, and WebSocket full/delta request attempts. `delta_requests` and `delta_hit_rate` show whether the WebSocket delta path is being used.
+
+Reset counters with:
+
+```text
+/mixlayer-stats reset
+```
+
 ## Debug Logging
 
 Set `MIXLAYER_DEBUG_LOGS=1` to write provider request/response debug logs to:

@@ -18,6 +18,7 @@ import {
 
 const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64;
 const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS = 15_000;
+const SESSION_WEBSOCKET_CACHE_TTL_MS = 5 * 60 * 1000;
 const WEBSOCKET_NORMAL_CLOSE_CODE = 1000;
 
 const MIXLAYER_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
@@ -25,6 +26,10 @@ const MIXLAYER_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencod
 type ResponsesStreamEvent = Record<string, any>;
 type ResponsesPayload = Record<string, unknown>;
 type PayloadSanitizer = (payload: unknown) => unknown;
+
+interface ResponsesWebSocketStreamOptions {
+	delta?: boolean;
+}
 
 interface WebSocketLike {
 	readonly readyState?: number;
@@ -43,6 +48,28 @@ interface WebSocketLike {
 interface WebSocketConstructorLike {
 	new (url: string | URL, options?: { headers?: Record<string, string> }): WebSocketLike;
 }
+
+interface WebSocketContinuation {
+	lastRequestBody: ResponsesPayload;
+	lastResponseId: string;
+	lastResponseItems: unknown[];
+}
+
+interface WebSocketSessionEntry {
+	socket: WebSocketLike;
+	busy: boolean;
+	idleTimer?: ReturnType<typeof setTimeout>;
+	continuation?: WebSocketContinuation;
+}
+
+interface WebSocketLease {
+	socket: WebSocketLike;
+	entry?: WebSocketSessionEntry;
+	release: (options?: { keep?: boolean }) => void;
+}
+
+const websocketSessionCache = new Map<string, WebSocketSessionEntry>();
+const deltaDisabledSessions = new Set<string>();
 
 function sanitizeSurrogates(text: string): string {
 	return text.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "");
@@ -411,7 +438,6 @@ function buildResponsesWebSocketPayload<TApi extends Api>(model: Model<TApi>, co
 		model: model.id,
 		input: convertResponsesMessages(model, context),
 		prompt_cache_key: cacheRetention === "none" ? undefined : clampOpenAIPromptCacheKey(options?.sessionId),
-		store: false,
 	};
 
 	if (options?.maxTokens) {
@@ -535,6 +561,44 @@ function closeWebSocketSilently(socket: WebSocketLike, reason = "done"): void {
 	}
 }
 
+function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
+	if (typeof timer === "object" && "unref" in timer && typeof timer.unref === "function") {
+		timer.unref();
+	}
+}
+
+function getWebSocketReadyState(socket: WebSocketLike): number | undefined {
+	return typeof socket.readyState === "number" ? socket.readyState : undefined;
+}
+
+function isWebSocketReusable(socket: WebSocketLike): boolean {
+	const readyState = getWebSocketReadyState(socket);
+	return readyState === undefined || readyState === 1;
+}
+
+function closeSessionEntry(sessionId: string, entry: WebSocketSessionEntry): void {
+	if (entry.idleTimer) {
+		clearTimeout(entry.idleTimer);
+	}
+	closeWebSocketSilently(entry.socket);
+	if (websocketSessionCache.get(sessionId) === entry) {
+		websocketSessionCache.delete(sessionId);
+	}
+}
+
+function scheduleSessionWebSocketExpiry(sessionId: string, entry: WebSocketSessionEntry): void {
+	if (entry.idleTimer) {
+		clearTimeout(entry.idleTimer);
+	}
+	entry.idleTimer = setTimeout(() => {
+		if (entry.busy) {
+			return;
+		}
+		closeSessionEntry(sessionId, entry);
+	}, SESSION_WEBSOCKET_CACHE_TTL_MS);
+	unrefTimer(entry.idleTimer);
+}
+
 async function connectWebSocket(url: string, headers: Record<string, string>, signal: AbortSignal | undefined, connectTimeoutMs: number): Promise<WebSocketLike> {
 	const WebSocketCtor = await getWebSocketConstructor();
 	return new Promise((resolve, reject) => {
@@ -588,11 +652,76 @@ async function connectWebSocket(url: string, headers: Record<string, string>, si
 			timeout = setTimeout(() => {
 				fail(new Error(`WebSocket connect timeout after ${connectTimeoutMs}ms`), "connect_timeout");
 			}, connectTimeoutMs);
+			unrefTimer(timeout);
 		}
 		if (signal?.aborted) {
 			onAbort();
 		}
 	});
+}
+
+async function acquireWebSocket(
+	url: string,
+	headers: Record<string, string>,
+	sessionId: string | undefined,
+	signal: AbortSignal | undefined,
+	connectTimeoutMs: number,
+	cacheable: boolean,
+): Promise<WebSocketLease> {
+	if (!cacheable || !sessionId) {
+		const socket = await connectWebSocket(url, headers, signal, connectTimeoutMs);
+		return {
+			socket,
+			release: () => closeWebSocketSilently(socket),
+		};
+	}
+
+	const cached = websocketSessionCache.get(sessionId);
+	if (cached) {
+		if (cached.idleTimer) {
+			clearTimeout(cached.idleTimer);
+			cached.idleTimer = undefined;
+		}
+		if (!cached.busy && isWebSocketReusable(cached.socket)) {
+			cached.busy = true;
+			return {
+				socket: cached.socket,
+				entry: cached,
+				release: ({ keep } = {}) => {
+					if (!keep || !isWebSocketReusable(cached.socket)) {
+						closeSessionEntry(sessionId, cached);
+						return;
+					}
+					cached.busy = false;
+					scheduleSessionWebSocketExpiry(sessionId, cached);
+				},
+			};
+		}
+		if (cached.busy) {
+			const socket = await connectWebSocket(url, headers, signal, connectTimeoutMs);
+			return {
+				socket,
+				release: () => closeWebSocketSilently(socket),
+			};
+		}
+		closeSessionEntry(sessionId, cached);
+	}
+
+	const socket = await connectWebSocket(url, headers, signal, connectTimeoutMs);
+	const entry: WebSocketSessionEntry = { socket, busy: true };
+	websocketSessionCache.set(sessionId, entry);
+	return {
+		socket,
+		entry,
+		release: ({ keep } = {}) => {
+			if (!keep || !isWebSocketReusable(entry.socket)) {
+				closeSessionEntry(sessionId, entry);
+				return;
+			}
+			entry.busy = false;
+			scheduleSessionWebSocketExpiry(sessionId, entry);
+		},
+	};
 }
 
 async function decodeWebSocketData(data: unknown): Promise<string | null> {
@@ -750,6 +879,100 @@ function mapStopReason(status: unknown): AssistantMessage["stopReason"] {
 		default:
 			throw new Error(`Unhandled stop reason: ${String(status)}`);
 	}
+}
+
+function cloneJson<T>(value: T): T {
+	return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function requestBodyWithoutInput(body: ResponsesPayload): ResponsesPayload {
+	const { input: _input, previous_response_id: _previousResponseId, ...rest } = body;
+	return rest;
+}
+
+function jsonEqual(a: unknown, b: unknown): boolean {
+	return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function getInputItems(body: ResponsesPayload): unknown[] | undefined {
+	return Array.isArray(body.input) ? body.input : undefined;
+}
+
+function inputStartsWith(input: unknown[], prefix: unknown[]): boolean {
+	if (input.length < prefix.length) {
+		return false;
+	}
+	for (let index = 0; index < prefix.length; index++) {
+		if (!jsonEqual(input[index], prefix[index])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function buildDeltaRequestBody(currentBody: ResponsesPayload, continuation: WebSocketContinuation | undefined): ResponsesPayload | undefined {
+	if (!continuation) {
+		return undefined;
+	}
+	if (!continuation.lastResponseId) {
+		return undefined;
+	}
+	if (!jsonEqual(requestBodyWithoutInput(currentBody), requestBodyWithoutInput(continuation.lastRequestBody))) {
+		return undefined;
+	}
+
+	const currentInput = getInputItems(currentBody);
+	const previousInput = getInputItems(continuation.lastRequestBody);
+	if (!currentInput || !previousInput) {
+		return undefined;
+	}
+
+	const expectedPrefix = [...previousInput, ...continuation.lastResponseItems];
+	if (!inputStartsWith(currentInput, expectedPrefix)) {
+		return undefined;
+	}
+
+	const deltaInput = currentInput.slice(expectedPrefix.length);
+	if (deltaInput.length === 0) {
+		return undefined;
+	}
+
+	return {
+		...currentBody,
+		previous_response_id: continuation.lastResponseId,
+		input: deltaInput,
+	};
+}
+
+function buildAssistantResponseItems<TApi extends Api>(model: Model<TApi>, output: AssistantMessage): unknown[] {
+	return convertResponsesMessages(model, { messages: [output] }).filter((item) => {
+		return !(item && typeof item === "object" && "type" in item && item.type === "function_call_output");
+	});
+}
+
+function updateContinuation<TApi extends Api>(
+	entry: WebSocketSessionEntry | undefined,
+	model: Model<TApi>,
+	fullRequestBody: ResponsesPayload,
+	output: AssistantMessage,
+): void {
+	if (!entry) {
+		return;
+	}
+	if (!output.responseId || output.stopReason === "error" || output.stopReason === "aborted") {
+		entry.continuation = undefined;
+		return;
+	}
+	entry.continuation = {
+		lastRequestBody: cloneJson(fullRequestBody),
+		lastResponseId: output.responseId,
+		lastResponseItems: cloneJson(buildAssistantResponseItems(model, output)),
+	};
+}
+
+function isRecoverableDeltaError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return /previous_response|previous_response_id|unsupported_parameter/i.test(message);
 }
 
 async function processResponsesStream<TApi extends Api>(
@@ -952,12 +1175,26 @@ function normalizeTimeoutMs(value: number | undefined): number | undefined {
 	return Math.floor(value);
 }
 
-export function createResponsesWebSocketStreamSimple(sanitizePayload: PayloadSanitizer) {
+async function sendResponsesWebSocketRequest<TApi extends Api>(
+	socket: WebSocketLike,
+	requestBody: ResponsesPayload,
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	model: Model<TApi>,
+	options: SimpleStreamOptions | undefined,
+	idleTimeoutMs: number | undefined,
+): Promise<void> {
+	socket.send(JSON.stringify({ type: "response.create", ...requestBody }));
+	await processResponsesStream(normalizeResponsesWebSocketEvents(parseWebSocket(socket, options?.signal, idleTimeoutMs)), output, stream, model);
+}
+
+export function createResponsesWebSocketStreamSimple(sanitizePayload: PayloadSanitizer, streamOptions: ResponsesWebSocketStreamOptions = {}) {
 	return (model: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream => {
 		const stream = createAssistantMessageEventStream();
 		void (async () => {
 			const output = createEmptyAssistantMessage(model);
-			let socket: WebSocketLike | undefined;
+			let lease: WebSocketLease | undefined;
+			let keepLease = false;
 			try {
 				const apiKey = options?.apiKey;
 				if (!apiKey) {
@@ -970,37 +1207,78 @@ export function createResponsesWebSocketStreamSimple(sanitizePayload: PayloadSan
 				if (!payload || typeof payload !== "object") {
 					throw new Error("Mixlayer Responses WebSocket payload must be an object.");
 				}
+				const fullRequestBody = payload as ResponsesPayload;
 
 				const connectTimeoutMs = normalizeTimeoutMs(options?.websocketConnectTimeoutMs) ?? DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS;
 				const idleTimeoutMs = normalizeTimeoutMs(options?.timeoutMs);
-				socket = await connectWebSocket(
+				const sessionId = options?.sessionId;
+				const deltaEnabled = streamOptions.delta === true;
+				const cacheable = deltaEnabled && !!sessionId && !deltaDisabledSessions.has(sessionId);
+				lease = await acquireWebSocket(
 					resolveResponsesWebSocketUrl(model.baseUrl),
 					buildWebSocketHeaders(model, apiKey, options),
+					sessionId,
 					options?.signal,
 					connectTimeoutMs,
+					cacheable,
 				);
 
-				socket.send(JSON.stringify({ type: "response.create", ...(payload as ResponsesPayload) }));
+				let requestBody = cacheable ? buildDeltaRequestBody(fullRequestBody, lease.entry?.continuation) : undefined;
+				let sentDelta = requestBody !== undefined;
+				requestBody ??= fullRequestBody;
+
 				stream.push({ type: "start", partial: output });
-				await processResponsesStream(normalizeResponsesWebSocketEvents(parseWebSocket(socket, options?.signal, idleTimeoutMs)), output, stream, model);
+				try {
+					await sendResponsesWebSocketRequest(lease.socket, requestBody, output, stream, model, options, idleTimeoutMs);
+				} catch (error) {
+					if (!sentDelta || output.content.length > 0 || !isRecoverableDeltaError(error)) {
+						throw error;
+					}
+
+					if (sessionId) {
+						deltaDisabledSessions.add(sessionId);
+					}
+					if (lease.entry) {
+						lease.entry.continuation = undefined;
+					}
+					lease.release({ keep: false });
+					lease = undefined;
+					lease = await acquireWebSocket(
+						resolveResponsesWebSocketUrl(model.baseUrl),
+						buildWebSocketHeaders(model, apiKey, options),
+						sessionId,
+						options?.signal,
+						connectTimeoutMs,
+						false,
+					);
+					sentDelta = false;
+					requestBody = fullRequestBody;
+					await sendResponsesWebSocketRequest(lease.socket, requestBody, output, stream, model, options, idleTimeoutMs);
+				}
+
 				if (options?.signal?.aborted) {
 					throw new Error("Request was aborted");
 				}
 				if (output.stopReason === "error" || output.stopReason === "aborted") {
 					throw new Error(output.errorMessage || "An unknown error occurred");
 				}
+				if (cacheable && lease.entry) {
+					updateContinuation(lease.entry, model, fullRequestBody, output);
+				}
+				keepLease = cacheable && !!lease.entry && !options?.signal?.aborted;
 				stream.push({ type: "done", reason: output.stopReason, message: output });
 				stream.end();
 			} catch (error) {
+				if (lease?.entry) {
+					lease.entry.continuation = undefined;
+				}
 				stripStreamingScratch(output);
 				output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 				output.errorMessage = error instanceof Error ? error.message : String(error);
 				stream.push({ type: "error", reason: output.stopReason, error: output });
 				stream.end();
 			} finally {
-				if (socket) {
-					closeWebSocketSilently(socket);
-				}
+				lease?.release({ keep: keepLease });
 			}
 		})();
 		return stream;

@@ -1,6 +1,6 @@
 {
 	"name": "pi-mixlayer",
-	"version": "0.2.0",
+	"version": "0.3.0",
 	"description": "Mixlayer provider extension for pi.",
 	"type": "module",
 	"keywords": [
@@ -10,24 +10,29 @@
 		"mixlayer"
 	],
 	"files": [
-		"index.ts",
+		"dist",
 		"README.md",
 		"package.json"
 	],
 	"scripts": {
-		"clean": "echo 'nothing to clean'",
-		"build": "echo 'nothing to build'",
-		"check": "tsc --noEmit"
+		"clean": "rm -rf dist",
+		"build": "tsc",
+		"check": "tsc --noEmit",
+		"prepublishOnly": "npm run clean && npm run build"
 	},
 	"pi": {
 		"extensions": [
-			"./index.ts"
+			"./dist/index.js"
 		]
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*"
 	},
+	"dependencies": {
+		"@earendil-works/pi-ai": "^0.78.1"
+	},
 	"devDependencies": {
+		"@earendil-works/pi-ai": "^0.78.1",
 		"@earendil-works/pi-coding-agent": "0.78.1",
 		"typescript": "5.9.3"
 	}

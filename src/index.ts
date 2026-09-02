@@ -7,8 +7,8 @@ import {
 	type Context,
 	type Model,
 	type SimpleStreamOptions,
-	streamSimpleOpenAIResponses,
 } from "@earendil-works/pi-ai";
+import { streamSimple as streamSimpleOpenAIResponses } from "@earendil-works/pi-ai/api/openai-responses";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -348,7 +348,7 @@ function toProviderModel(model: MixlayerModel, transport: MixlayerTransport): Pr
 		compat: {
 			supportsDeveloperRole: false,
 			// Mixlayer rejects the underscore-containing `session_id` header.
-			sendSessionIdHeader: false,
+			sessionAffinityFormat: "openai-nosession",
 			// Mixlayer rejects `prompt_cache_retention` as an unknown parameter.
 			supportsLongCacheRetention: false,
 		},

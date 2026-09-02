@@ -1,8 +1,6 @@
 import {
-	calculateCost,
 	clampThinkingLevel,
 	createAssistantMessageEventStream,
-	parseStreamingJson,
 	type Api,
 	type AssistantMessage,
 	type AssistantMessageEventStream,
@@ -15,6 +13,7 @@ import {
 	type Tool,
 	type ToolCall,
 } from "@earendil-works/pi-ai";
+import { processResponsesStream } from "@earendil-works/pi-ai/api/openai-responses-shared";
 
 const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64;
 const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS = 15_000;
@@ -284,14 +283,6 @@ function transformMessages<TApi extends Api>(messages: Message[], model: Model<T
 	return result;
 }
 
-function encodeTextSignatureV1(id: string, phase?: "commentary" | "final_answer"): string {
-	const payload: { v: 1; id: string; phase?: "commentary" | "final_answer" } = { v: 1, id };
-	if (phase) {
-		payload.phase = phase;
-	}
-	return JSON.stringify(payload);
-}
-
 function parseTextSignature(signature: string | undefined): { id: string; phase?: "commentary" | "final_answer" } | undefined {
 	if (!signature) {
 		return undefined;
@@ -487,7 +478,7 @@ function createEmptyAssistantMessage<TApi extends Api>(model: Model<TApi>): Assi
 			totalTokens: 0,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
-		stopReason: "stop",
+		stopReason: "pending",
 		timestamp: Date.now(),
 	};
 }
@@ -852,32 +843,15 @@ async function* normalizeResponsesWebSocketEvents(events: AsyncIterable<Response
 		if (!type) {
 			continue;
 		}
-		if (type === "response.done" || type === "response.incomplete") {
+		if (type === "response.done") {
 			const response = event.response;
 			yield { ...event, type: "response.completed", response };
 			return;
 		}
 		yield event;
-		if (type === "response.completed") {
+		if (type === "response.completed" || type === "response.incomplete") {
 			return;
 		}
-	}
-}
-
-function mapStopReason(status: unknown): AssistantMessage["stopReason"] {
-	switch (status) {
-		case undefined:
-		case "completed":
-		case "in_progress":
-		case "queued":
-			return "stop";
-		case "incomplete":
-			return "length";
-		case "failed":
-		case "cancelled":
-			return "error";
-		default:
-			throw new Error(`Unhandled stop reason: ${String(status)}`);
 	}
 }
 
@@ -975,190 +949,6 @@ function isRecoverableDeltaError(error: unknown): boolean {
 	return /previous_response|previous_response_id|unsupported_parameter/i.test(message);
 }
 
-async function processResponsesStream<TApi extends Api>(
-	openaiStream: AsyncIterable<ResponsesStreamEvent>,
-	output: AssistantMessage,
-	stream: AssistantMessageEventStream,
-	model: Model<TApi>,
-): Promise<void> {
-	let currentItem: ResponsesStreamEvent | null = null;
-	let currentBlock: (AssistantMessage["content"][number] & { partialJson?: string }) | null = null;
-	const blockIndex = () => output.content.length - 1;
-
-	for await (const event of openaiStream) {
-		if (event.type === "response.created") {
-			output.responseId = event.response?.id;
-		} else if (event.type === "response.output_item.added") {
-			const item = event.item;
-			if (item?.type === "reasoning") {
-				currentItem = item;
-				currentBlock = { type: "thinking", thinking: "" };
-				output.content.push(currentBlock);
-				stream.push({ type: "thinking_start", contentIndex: blockIndex(), partial: output });
-			} else if (item?.type === "message") {
-				currentItem = item;
-				currentBlock = { type: "text", text: "" };
-				output.content.push(currentBlock);
-				stream.push({ type: "text_start", contentIndex: blockIndex(), partial: output });
-			} else if (item?.type === "function_call") {
-				currentItem = item;
-				currentBlock = {
-					type: "toolCall",
-					id: `${item.call_id}|${item.id}`,
-					name: item.name,
-					arguments: {},
-					partialJson: item.arguments || "",
-				};
-				output.content.push(currentBlock);
-				stream.push({ type: "toolcall_start", contentIndex: blockIndex(), partial: output });
-			}
-		} else if (event.type === "response.reasoning_summary_part.added") {
-			if (currentItem?.type === "reasoning") {
-				currentItem.summary = currentItem.summary || [];
-				currentItem.summary.push(event.part);
-			}
-		} else if (event.type === "response.reasoning_summary_text.delta") {
-			if (currentItem?.type === "reasoning" && currentBlock?.type === "thinking") {
-				currentItem.summary = currentItem.summary || [];
-				const lastPart = currentItem.summary[currentItem.summary.length - 1];
-				if (lastPart) {
-					currentBlock.thinking += event.delta;
-					lastPart.text += event.delta;
-					stream.push({ type: "thinking_delta", contentIndex: blockIndex(), delta: event.delta, partial: output });
-				}
-			}
-		} else if (event.type === "response.reasoning_summary_part.done") {
-			if (currentItem?.type === "reasoning" && currentBlock?.type === "thinking") {
-				currentItem.summary = currentItem.summary || [];
-				const lastPart = currentItem.summary[currentItem.summary.length - 1];
-				if (lastPart) {
-					currentBlock.thinking += "\n\n";
-					lastPart.text += "\n\n";
-					stream.push({ type: "thinking_delta", contentIndex: blockIndex(), delta: "\n\n", partial: output });
-				}
-			}
-		} else if (event.type === "response.reasoning_text.delta") {
-			if (currentItem?.type === "reasoning" && currentBlock?.type === "thinking") {
-				currentBlock.thinking += event.delta;
-				stream.push({ type: "thinking_delta", contentIndex: blockIndex(), delta: event.delta, partial: output });
-			}
-		} else if (event.type === "response.content_part.added") {
-			if (currentItem?.type === "message") {
-				currentItem.content = currentItem.content || [];
-				if (event.part?.type === "output_text" || event.part?.type === "refusal") {
-					currentItem.content.push(event.part);
-				}
-			}
-		} else if (event.type === "response.output_text.delta") {
-			if (currentItem?.type === "message" && currentBlock?.type === "text") {
-				const lastPart = currentItem.content?.[currentItem.content.length - 1];
-				if (lastPart?.type === "output_text") {
-					currentBlock.text += event.delta;
-					lastPart.text += event.delta;
-					stream.push({ type: "text_delta", contentIndex: blockIndex(), delta: event.delta, partial: output });
-				}
-			}
-		} else if (event.type === "response.refusal.delta") {
-			if (currentItem?.type === "message" && currentBlock?.type === "text") {
-				const lastPart = currentItem.content?.[currentItem.content.length - 1];
-				if (lastPart?.type === "refusal") {
-					currentBlock.text += event.delta;
-					lastPart.refusal += event.delta;
-					stream.push({ type: "text_delta", contentIndex: blockIndex(), delta: event.delta, partial: output });
-				}
-			}
-		} else if (event.type === "response.function_call_arguments.delta") {
-			if (currentItem?.type === "function_call" && currentBlock?.type === "toolCall") {
-				currentBlock.partialJson = `${currentBlock.partialJson ?? ""}${event.delta}`;
-				currentBlock.arguments = parseStreamingJson(currentBlock.partialJson);
-				stream.push({ type: "toolcall_delta", contentIndex: blockIndex(), delta: event.delta, partial: output });
-			}
-		} else if (event.type === "response.function_call_arguments.done") {
-			if (currentItem?.type === "function_call" && currentBlock?.type === "toolCall") {
-				const previousPartialJson = currentBlock.partialJson ?? "";
-				currentBlock.partialJson = event.arguments;
-				currentBlock.arguments = parseStreamingJson(currentBlock.partialJson);
-				if (typeof event.arguments === "string" && event.arguments.startsWith(previousPartialJson)) {
-					const delta = event.arguments.slice(previousPartialJson.length);
-					if (delta.length > 0) {
-						stream.push({ type: "toolcall_delta", contentIndex: blockIndex(), delta, partial: output });
-					}
-				}
-			}
-		} else if (event.type === "response.output_item.done") {
-			const item = event.item;
-			if (item?.type === "reasoning" && currentBlock?.type === "thinking") {
-				const summaryText = item.summary?.map((summary: { text?: string }) => summary.text).join("\n\n") || "";
-				const contentText = item.content?.map((content: { text?: string }) => content.text).join("\n\n") || "";
-				currentBlock.thinking = summaryText || contentText || currentBlock.thinking;
-				currentBlock.thinkingSignature = JSON.stringify(item);
-				stream.push({ type: "thinking_end", contentIndex: blockIndex(), content: currentBlock.thinking, partial: output });
-				currentBlock = null;
-			} else if (item?.type === "message" && currentBlock?.type === "text") {
-				currentBlock.text = item.content.map((content: { type: string; text?: string; refusal?: string }) => (content.type === "output_text" ? content.text : content.refusal)).join("");
-				currentBlock.textSignature = encodeTextSignatureV1(item.id, item.phase);
-				stream.push({ type: "text_end", contentIndex: blockIndex(), content: currentBlock.text, partial: output });
-				currentBlock = null;
-			} else if (item?.type === "function_call") {
-				const args =
-					currentBlock?.type === "toolCall" && currentBlock.partialJson
-						? parseStreamingJson(currentBlock.partialJson)
-						: parseStreamingJson(item.arguments || "{}");
-				let toolCall: ToolCall;
-				if (currentBlock?.type === "toolCall") {
-					currentBlock.arguments = args;
-					delete currentBlock.partialJson;
-					toolCall = currentBlock;
-				} else {
-					toolCall = {
-						type: "toolCall",
-						id: `${item.call_id}|${item.id}`,
-						name: item.name,
-						arguments: args,
-					};
-				}
-				currentBlock = null;
-				stream.push({ type: "toolcall_end", contentIndex: blockIndex(), toolCall, partial: output });
-			}
-		} else if (event.type === "response.completed") {
-			const response = event.response;
-			if (response?.id) {
-				output.responseId = response.id;
-			}
-			if (response?.usage) {
-				const cachedTokens = response.usage.input_tokens_details?.cached_tokens || 0;
-				output.usage = {
-					input: (response.usage.input_tokens || 0) - cachedTokens,
-					output: response.usage.output_tokens || 0,
-					cacheRead: cachedTokens,
-					cacheWrite: 0,
-					totalTokens: response.usage.total_tokens || 0,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				};
-			}
-			calculateCost(model, output.usage);
-			output.stopReason = mapStopReason(response?.status);
-			if (output.content.some((block) => block.type === "toolCall") && output.stopReason === "stop") {
-				output.stopReason = "toolUse";
-			}
-		} else if (event.type === "error") {
-			const error = event.error && typeof event.error === "object" ? event.error : undefined;
-			const code = event.code ?? error?.code ?? error?.type;
-			const message = event.message ?? error?.message;
-			throw new Error(message ? `${code ? `${code}: ` : ""}${message}` : JSON.stringify(event));
-		} else if (event.type === "response.failed") {
-			const error = event.response?.error;
-			const details = event.response?.incomplete_details;
-			const message = error
-				? `${error.code || "unknown"}: ${error.message || "no message"}`
-				: details?.reason
-					? `incomplete: ${details.reason}`
-					: "Unknown error (no error details in response)";
-			throw new Error(message);
-		}
-	}
-}
-
 function stripStreamingScratch(output: AssistantMessage): void {
 	for (const block of output.content) {
 		delete (block as { partialJson?: string }).partialJson;
@@ -1185,7 +975,14 @@ async function sendResponsesWebSocketRequest<TApi extends Api>(
 	idleTimeoutMs: number | undefined,
 ): Promise<void> {
 	socket.send(JSON.stringify({ type: "response.create", ...requestBody }));
-	await processResponsesStream(normalizeResponsesWebSocketEvents(parseWebSocket(socket, options?.signal, idleTimeoutMs)), output, stream, model);
+	await processResponsesStream(
+		normalizeResponsesWebSocketEvents(parseWebSocket(socket, options?.signal, idleTimeoutMs)) as Parameters<
+			typeof processResponsesStream
+		>[0],
+		output,
+		stream,
+		model,
+	);
 }
 
 export function createResponsesWebSocketStreamSimple(sanitizePayload: PayloadSanitizer, streamOptions: ResponsesWebSocketStreamOptions = {}) {
@@ -1258,6 +1055,9 @@ export function createResponsesWebSocketStreamSimple(sanitizePayload: PayloadSan
 
 				if (options?.signal?.aborted) {
 					throw new Error("Request was aborted");
+				}
+				if (output.stopReason === "pending") {
+					throw new Error("Mixlayer Responses WebSocket stream ended without a stop reason");
 				}
 				if (output.stopReason === "error" || output.stopReason === "aborted") {
 					throw new Error(output.errorMessage || "An unknown error occurred");
